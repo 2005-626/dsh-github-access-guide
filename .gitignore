@@ -1,3 +1,7 @@
 node_modules/
 *.log
 .DS_Store
+_rel/
+_*.json
+_entry.yml
+dsh-github-access-guide.tgz
