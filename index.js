@@ -41,6 +41,10 @@ const PROBE_REPO = 'octocat/Hello-World.git'
 const MAX_BODY_BYTES = 64 * 1024
 const GIT_TIMEOUT_MS = 25_000
 const NET_TIMEOUT_MS = 8_000
+/* A channel probe is a go/no-go test, not a transfer. A prefix that cannot answer
+ * `ls-remote` in twelve seconds is not one worth installing, and waiting the full
+ * transfer timeout for it makes the panel's channel list take half a minute. */
+const PROBE_GIT_TIMEOUT_MS = 12_000
 
 /**
  * Accelerators, most reliable first.
@@ -246,7 +250,7 @@ async function probeChannels() {
   const probes = await Promise.all(CHANNELS.map(async (channel) => {
     const started = Date.now()
     // Every channel is tested through git, because the rewrite is what the fix installs.
-    const gitResult = await git(['ls-remote', `${channel.gitPrefix}${PROBE_REPO}`], GIT_TIMEOUT_MS)
+    const gitResult = await git(['ls-remote', `${channel.gitPrefix}${PROBE_REPO}`], PROBE_GIT_TIMEOUT_MS)
     const gitOk = gitResult.ok === true && /refs\//u.test(gitResult.stdout)
     const gitMs = Date.now() - started
     if (channel.urlPrefix === null) {
@@ -289,15 +293,26 @@ async function probeChannels() {
  * every reader within the window, so the panel never stacks slow requests. */
 const CHANNEL_CACHE_MS = 20_000
 let channelCache = { at: 0, value: undefined }
+let channelsInflight
 
 async function probeChannelsCached(force) {
   const now = Date.now()
   if (force !== true && channelCache.value !== undefined && now - channelCache.at < CHANNEL_CACHE_MS) {
     return channelCache.value
   }
-  const value = await probeChannels()
-  channelCache = { at: Date.now(), value }
-  return value
+  /* Single flight. Three channels probed at once is slow enough that the panel would
+   * otherwise start a second sweep while the first one is still running. */
+  if (channelsInflight === undefined) {
+    channelsInflight = probeChannels()
+      .then((value) => {
+        channelCache = { at: Date.now(), value }
+        return value
+      })
+      .finally(() => {
+        channelsInflight = undefined
+      })
+  }
+  return channelsInflight
 }
 
 /** The cheap half: live counters plus what the machine is configured to do. */
@@ -319,6 +334,27 @@ async function collectStatus() {
     git(['--version'], 8000),
     probeChannelsCached(),
   ])
+  const rest = await collectRest(direct, rewrites, gitVersion)
+  return { ...rest, channels, mirrors: MIRRORS }
+}
+
+/**
+ * Everything except the channel sweep.
+ *
+ * The channel probe shells out to `git ls-remote` three times, and on a network that
+ * drops GitHub that is tens of seconds. The panel has to show the direct and git
+ * state immediately, so it asks for this first and for the channels separately.
+ */
+async function collectQuick() {
+  const [direct, rewrites, gitVersion] = await Promise.all([
+    probeDirectTls(),
+    readRewrites(),
+    git(['--version'], 8000),
+  ])
+  return collectRest(direct, rewrites, gitVersion)
+}
+
+async function collectRest(direct, rewrites, gitVersion) {
   const owned = ownedRewrites(rewrites.rules)
   const httpProxy = await git(['config', '--global', '--get', 'http.proxy'], 8000)
   const postBuffer = await git(['config', '--global', '--get', 'http.postBuffer'], 8000)
@@ -338,7 +374,6 @@ async function collectStatus() {
     system,
     tools,
     snapshot,
-    channels,
     mirrors: MIRRORS,
   }
 }
@@ -508,6 +543,8 @@ async function reconcileOnStart() {
 function routePaths(ns) {
   return Object.freeze({
     status: `/api/${ns}/status`,
+    quick: `/api/${ns}/quick`,
+    channels: `/api/${ns}/channels`,
     live: `/api/${ns}/live`,
     fix: `/api/${ns}/fix`,
     revert: `/api/${ns}/revert`,
@@ -546,6 +583,8 @@ export function registerRoutes(webServer) {
   }
 
   endpoint(paths.status, () => collectStatus())
+  endpoint(paths.quick, () => collectQuick())
+  endpoint(paths.channels, () => probeChannelsCached())
   endpoint(paths.live, () => collectLive())
   endpoint(paths.fix, (body) => applyFix(typeof body.channel === 'string' ? body.channel : undefined))
   endpoint(paths.revert, () => clearOwnedRewrites())
@@ -583,5 +622,14 @@ export function apply(ctx) {
    * once per load and never throws into the loader. */
   reconcileOnStart().catch(() => {})
 
-  return { status: collectStatus, live: collectLive, fix: applyFix, revert: clearOwnedRewrites, proxyOn: engageProxy, proxyOff: disengageProxy }
+  return {
+    status: collectStatus,
+    quick: collectQuick,
+    channels: () => probeChannelsCached(),
+    live: collectLive,
+    fix: applyFix,
+    revert: clearOwnedRewrites,
+    proxyOn: engageProxy,
+    proxyOff: disengageProxy,
+  }
 }

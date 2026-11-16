@@ -75,13 +75,19 @@ locale/*.json    Card title and description
 Routes, all `POST`, all requiring the normal DSH session:
 
 ```
-/api/github-access-guide/status     full state, probes every channel (cached 20 s)
+/api/github-access-guide/status     everything, including the channel sweep
+/api/github-access-guide/quick      direct + git state, no channel sweep
+/api/github-access-guide/channels   the channel sweep on its own (cached 20 s)
 /api/github-access-guide/live       cheap state only: listener, system proxy, git, env
 /api/github-access-guide/fix        install and verify an accelerator rewrite
 /api/github-access-guide/revert     remove the rules this plugin installed
 /api/github-access-guide/proxy/on   start the proxy and take over the system settings
 /api/github-access-guide/proxy/off  restore the snapshot and stop the proxy
 ```
+
+The split exists because the channel sweep shells out to `git ls-remote` three times,
+which takes tens of seconds on a network that drops GitHub. The panel asks for `quick`
+first so it fills in immediately, then fetches `channels` separately.
 
 ## Privacy
 

@@ -552,6 +552,8 @@ window.__ModuleLoader__.load({
      * ------------------------------------------------------------------ */
     const ROUTES = {
       status: '/api/github-access-guide/status',
+      quick: '/api/github-access-guide/quick',
+      channels: '/api/github-access-guide/channels',
       live: '/api/github-access-guide/live',
       fix: '/api/github-access-guide/fix',
       revert: '/api/github-access-guide/revert',
@@ -574,23 +576,42 @@ window.__ModuleLoader__.load({
     function ActionPanel(props) {
       const t = props.t;
       const [status, setStatus] = React.useState(undefined);
+      const [channels, setChannels] = React.useState(undefined);
+      const [channelsBusy, setChannelsBusy] = React.useState(false);
       const [busy, setBusy] = React.useState('');
       const [outcome, setOutcome] = React.useState(undefined);
       const [error, setError] = React.useState('');
+      const channelsPolling = React.useRef(false);
+
+      /* The channel sweep shells out to `git ls-remote` three times and on a network
+       * that drops GitHub that takes tens of seconds. Asking for it together with the
+       * direct/git state made this card sit on "Probing…" for the whole 43 s, so the
+       * two are fetched separately: the card fills in at once, and the channel rows
+       * arrive when they arrive. */
+      const loadChannels = React.useCallback(() => {
+        if (channelsPolling.current) return;
+        channelsPolling.current = true;
+        setChannelsBusy(true);
+        postJson(ROUTES.channels)
+          .then((value) => { setChannels(value); })
+          .catch(() => { /* keep the last known rows */ })
+          .then(() => { channelsPolling.current = false; setChannelsBusy(false); });
+      }, []);
 
       const refresh = React.useCallback(() => {
         setBusy('check');
         setError('');
-        postJson(ROUTES.status)
+        postJson(ROUTES.quick)
           .then((value) => {
             setStatus(value);
             setBusy('');
+            loadChannels();
           })
           .catch((e) => {
             setError(String(e && e.message ? e.message : e));
             setBusy('');
           });
-      }, []);
+      }, [loadChannels]);
 
       React.useEffect(() => {
         refresh();
@@ -603,9 +624,10 @@ window.__ModuleLoader__.load({
         postJson(path)
           .then((value) => {
             setOutcome({ kind: kind, value: value });
-            return postJson(ROUTES.status).then((next) => {
+            return postJson(ROUTES.quick).then((next) => {
               setStatus(next);
               setBusy('');
+              loadChannels();
             });
           })
           .catch((e) => {
@@ -644,8 +666,8 @@ window.__ModuleLoader__.load({
               : t('rewriteOff'))));
       }
 
-      const channelRows = status !== undefined && Array.isArray(status.channels)
-        ? status.channels.map((channel) => {
+      const channelRows = Array.isArray(channels)
+        ? channels.map((channel) => {
           /* One channel serves two different purposes: the git rewrite the fix installs,
            * and the file prefix the URL converter hands out. They fail independently,
            * so both are shown instead of one merged verdict. */
@@ -701,11 +723,13 @@ window.__ModuleLoader__.load({
         rows.length > 0 ? h('div', { className: 'ghg-statusbox' }, rows) : null,
         channelRows.length > 0
           ? h('div', { className: 'ghg-statusbox' },
-            h('div', { className: 'ghg-grouplabel' }, t('stChannels')), channelRows)
-          : null,
+            h('div', { className: 'ghg-grouplabel' }, t('stChannels') + (channelsBusy === true ? ' · ' + t('busyCheck') : '')), channelRows)
+          : (channelsBusy === true
+            ? h('div', { className: 'ghg-statusbox' }, h('div', { className: 'ghg-grouplabel' }, t('stChannels') + ' · ' + t('busyCheck')))
+            : null),
         outcomeNodes.length > 0 ? h('div', { key: 'out' }, outcomeNodes) : null,
         h('div', { key: 'url', style: { marginTop: '12px' } },
-          h(UrlBox, { t: t, channels: status !== undefined && Array.isArray(status.channels) ? status.channels : [] })),
+          h(UrlBox, { t: t, channels: Array.isArray(channels) ? channels : [] })),
         h('p', { className: 'ghg-actnote ghg-muted' }, t('revertNote')),
         status !== undefined && status.direct && status.direct.ok !== true
           ? h('p', { className: 'ghg-actnote' }, t('blockedNote'))
@@ -761,8 +785,8 @@ window.__ModuleLoader__.load({
         postJson(path)
           .then((value) => {
             setOutcome({ kind: kind, value: value });
-            return postJson(ROUTES.status).then((next) => {
-              setStatus(next);
+            return postJson(ROUTES.live).then((next) => {
+              setStatus((prev) => (prev === undefined ? next : Object.assign({}, prev, next)));
               setBusy('');
             });
           })
