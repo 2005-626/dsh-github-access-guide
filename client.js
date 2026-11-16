@@ -88,6 +88,9 @@ window.__ModuleLoader__.load({
       proxyTraffic: { zh: '流量', en: 'traffic' },
       proxyWinners: { zh: '胜出的地址', en: 'winning addresses' },
       proxySuspect: { zh: '暂时降级的地址', en: 'deprioritised addresses' },
+      proxyProbes: { zh: '握手验证', en: 'handshake checks' },
+      proxyHealthy: { zh: '已验证可握手的地址', en: 'handshake-verified addresses' },
+      proxySeed: { zh: '记住的地址', en: 'remembered addresses' },
       proxySysOn: { zh: '系统代理已指向本机', en: 'system proxy points here' },
       proxySysOff: { zh: '系统代理未指向本机', en: 'system proxy does not point here' },
       proxyGitOn: { zh: 'git 已走代理', en: 'git uses the proxy' },
@@ -800,6 +803,9 @@ window.__ModuleLoader__.load({
             t('proxyTunnels') + ' ' + proxy.tunnels,
           ];
           if (proxy.failures > 0) counters.push(t('proxyFails') + ' ' + proxy.failures);
+          if (typeof proxy.tlsProbes === 'number' && proxy.tlsProbes > 0) {
+            counters.push(t('proxyProbes') + ' ' + proxy.tlsProbesOk + '/' + proxy.tlsProbes);
+          }
           if (typeof proxy.avgConnectMs === 'number') counters.push(t('proxyAvg') + ' ' + proxy.avgConnectMs + 'ms');
           const kb = Math.round(((proxy.bytesDown || 0) + (proxy.bytesUp || 0)) / 1024);
           counters.push(t('proxyTraffic') + ' ' + kb + 'KB');
@@ -848,6 +854,14 @@ window.__ModuleLoader__.load({
         proxy !== undefined && Array.isArray(proxy.suspect) && proxy.suspect.length > 0
           ? h('p', { className: 'ghg-muted', style: { margin: '6px 0 0' } },
             t('proxySuspect') + ' · ' + proxy.suspect.join(', '))
+          : null,
+        proxy !== undefined && Array.isArray(proxy.healthy) && proxy.healthy.length > 0
+          ? h('p', { className: 'ghg-muted', style: { margin: '6px 0 0' } },
+            t('proxyHealthy') + ' · ' + proxy.healthy.map((entry) => entry.host + ' → ' + entry.address).join(', '))
+          : null,
+        proxy !== undefined && Array.isArray(proxy.seed) && proxy.seed.length > 0
+          ? h('p', { className: 'ghg-muted', style: { margin: '6px 0 0' } },
+            t('proxySeed') + ' · ' + proxy.seed.map((entry) => entry.host + ' → ' + entry.addresses.join('/')).join(', '))
           : null,
         outcomeNodes.length > 0 ? h('div', { key: 'out' }, outcomeNodes) : null,
         h('p', { className: 'ghg-actnote ghg-muted' }, t('proxyRestoreNote')),

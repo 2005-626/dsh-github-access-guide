@@ -465,16 +465,40 @@ async function disengageProxy() {
  *                      clear it, because a proxy nobody listens on is worse than none.
  */
 async function reconcileOnStart() {
-  const system = await readSystemProxy()
-  const pointsHere = system.enabled === true && typeof system.server === 'string' && /^127\.0\.0\.1:\d+$/u.test(system.server)
-  if (pointsHere !== true) return { action: 'none' }
-  const snapshot = await readSnapshot()
+  const [system, tools, snapshot] = await Promise.all([readSystemProxy(), readToolProxy(), readSnapshot()])
+  const loopbackPort = (value) => {
+    if (typeof value !== 'string') return undefined
+    const match = /^http:\/\/127\.0\.0\.1:(\d+)\/?$/u.exec(value.trim())
+    return match === null ? undefined : Number(match[1])
+  }
+  const systemPort = system.enabled === true ? loopbackPort(`http://${String(system.server || '')}`) : undefined
+  const gitPort = loopbackPort(tools.git)
+  const envPort = loopbackPort(tools.env && (tools.env.HTTPS_PROXY || tools.env.HTTP_PROXY))
+  const leftHere = systemPort !== undefined || gitPort !== undefined || envPort !== undefined
+  if (leftHere !== true) return { action: 'none' }
+
   if (snapshot !== undefined) {
+    /* The user had this on: turn it back on, which also rewrites the git and env
+     * values to the port we are about to listen on. */
     const resumed = await engageProxy()
     return { action: 'resumed', engaged: resumed.engaged, server: resumed.server }
   }
+
+  /* No snapshot, but this plugin's settings survived it. `restore()` would only know
+   * about WinINET here, so clear the tool-level leftovers explicitly — a git proxy
+   * aimed at a closed loopback port makes `git clone` fail on every repository, and
+   * nothing else would ever clean it up. */
   const restored = await restore()
-  return { action: 'cleared-stale', system: restored.system }
+  if (gitPort !== undefined) {
+    await git(['config', '--global', '--unset-all', 'http.proxy'], 8000)
+    await git(['config', '--global', '--unset-all', 'https.proxy'], 8000)
+  }
+  if (envPort !== undefined) {
+    for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']) {
+      await execFileAsync('reg', ['delete', 'HKCU\\Environment', '/v', key, '/f'], { windowsHide: true, timeout: 10_000 }).catch(() => {})
+    }
+  }
+  return { action: 'cleared-stale', system: restored.system, tools: await readToolProxy() }
 }
 
 /* ------------------------------------------------------------------ */

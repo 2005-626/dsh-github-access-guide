@@ -23,7 +23,11 @@ The panel appears in the sidebar between **Automations** and **Context insights*
 
 An ordinary address lookup returns one address per host, and on a restricted network that one address is often the broken one. The proxy asks for every candidate address it can find (system DNS plus a small built-in pool of known GitHub addresses), dials **all of them at once**, and keeps whichever connects first — killing the rest immediately. Failure is therefore a race, not a wait for a timeout.
 
-Measured on a network where direct connections mostly timed out: 1 of 8 direct requests to `github.com` succeeded (each failure took 15 s), while 8 of 8 requests through the proxy succeeded in 0.71–1.10 s.
+For the GitHub hosts, opening a socket is not the finish line: these networks often accept the TCP connection and then reset it during the TLS handshake, so a race on `connect` alone picks an address that dies one millisecond later. For those hosts the proxy races the **handshake** instead, and only hands the browser an address that actually negotiated TLS. The verified address is remembered for two minutes. Everything else — every other site the machine loads through the same proxy — stays a plain TCP race, so nothing unrelated pays for the check.
+
+The winning address per host is written to `$DSH_HOME/github-access-guide/racing-seed.json`, so the first request after a restart starts from the address that worked last time instead of waiting for DNS. Only GitHub hosts are remembered.
+
+Measured on a network where direct connections mostly timed out: 1 of 8 direct requests to `github.com` succeeded (each failure took 15 s), while 8 of 8 requests through the proxy succeeded in 0.71–1.10 s. On a second network, after the handshake check was added: 2 of 4 direct requests failed, while 6 of 6 through the proxy succeeded in 0.67–0.90 s.
 
 Turning it on changes three layers, all of them reversible:
 
@@ -33,7 +37,7 @@ Turning it on changes three layers, all of them reversible:
 
 Before the first change, the previous values are written to `$DSH_HOME/github-access-guide/proxy-state.json`. **Stop proxy** restores that snapshot exactly, including deleting `ProxyServer` when you had no proxy to begin with, and then stops the listener. The same restore runs when the plugin is disabled or removed.
 
-If DSH exits while the proxy is engaged, the system would be left pointing at a dead port. On the next start the plugin checks for that: with a snapshot it re-engages, without one it clears the stale setting.
+If DSH exits while the proxy is engaged, the system would be left pointing at a dead port. On the next start the plugin checks that — and it checks all three layers, not just the system setting, because an orphaned `http.proxy` in the global git config makes every `git clone` fail with `Could not connect to server` and nothing else would ever clean it up. With a snapshot it re-engages; without one it clears whatever is still aimed at this port.
 
 ## The accelerator rewrite
 
