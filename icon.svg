@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="GitHub access guide">
+  <circle cx="32" cy="32" r="27" fill="#1f6feb"/>
+  <g fill="none" stroke="#ffffff" stroke-linecap="round">
+    <ellipse cx="32" cy="32" rx="12.5" ry="27" stroke-width="3.2" opacity="0.92"/>
+    <path d="M5.5 32h53" stroke-width="3.2" opacity="0.92"/>
+    <path d="M13 17.5h38M13 46.5h38" stroke-width="2.6" opacity="0.6"/>
+  </g>
+</svg>
