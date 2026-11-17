@@ -6,7 +6,7 @@ It ships two different fixes, because "GitHub is broken" is two different proble
 
 | Fix | What it does | When it helps |
 | --- | --- | --- |
-| **Start proxy** (加速代理) | Starts a local racing proxy on `127.0.0.1:17897` and points the system at it | Individual addresses are blocked or reset mid-flight, so direct connections flip between working and timing out |
+| **Start proxy** (加速代理) | Starts a local racing proxy on `127.0.0.1:17897` and points the system at it through a PAC that names both the proxy and `DIRECT` | Individual addresses are blocked or reset mid-flight, so direct connections flip between working and timing out |
 | **Repair** (一键修复) | Installs a reversible `git url.<accelerator>.insteadOf` rewrite | `git` specifically is what fails, and an accelerator host is reachable |
 
 ## Install
@@ -39,6 +39,26 @@ Before the first change, the previous values are written to `$DSH_HOME/github-ac
 
 If DSH exits while the proxy is engaged, the system would be left pointing at a dead port. On the next start the plugin checks that — and it checks all three layers, not just the system setting, because an orphaned `http.proxy` in the global git config makes every `git clone` fail with `Could not connect to server` and nothing else would ever clean it up. With a snapshot it re-engages; without one it clears whatever is still aimed at this port.
 
+## Which sites go through it
+
+The listener is installed as the **system** proxy, so every request the machine makes arrives at it. What happens next is decided by the PAC script it serves itself (`http://127.0.0.1:17897/proxy.pac`):
+
+| Scope | What is raced |
+| --- | --- |
+| default | the GitHub family: `github.com`, `*.githubusercontent.com`, `*.githubassets.com`, `*.github.io`, `*.githubapp.com`, `ghcr.io` |
+| **extra sites** (panel) | the domains or suffixes you add, subdomains included |
+| **full mode** (panel) | every site except loopback, `*.local`, single-label names and RFC 1918 addresses |
+| always direct | `localhost`, private/LAN addresses, bare host names |
+
+Two rules keep this safe for the sites it does *not* accelerate:
+
+- The PAC answer for a raced site is `PROXY 127.0.0.1:port; DIRECT`. A browser walks to the next entry when the proxy connection fails, so a listener that is restarting, busy or gone degrades to a direct connection instead of turning every tab into an error page.
+- A tunnel the proxy cannot establish is **closed**, not answered with `502`. An HTTP error is a final answer to a browser; a dropped connection is not, so the request falls through to `DIRECT` and behaves exactly as it would with no proxy at all.
+
+Everything outside the scope is forwarded verbatim — one parallel dial on that host's own DNS answers, then a plain byte pipe — so installing the proxy cannot make an unrelated site worse.
+
+The scope lives in `$DSH_HOME/github-access-guide/settings.json`. It is deliberately *not* part of `proxy-state.json`: that file is the record of the machine before the takeover and is deleted on restore, while this is a preference that has to outlive one.
+
 ## The accelerator rewrite
 
 **Repair** tries the accelerator channels in order, installs `git config --global url.<prefix>.insteadOf https://github.com/`, and then verifies with the **plain** GitHub URL — the one you actually type. A channel that installs but does not verify is removed before the next one is tried, so a reported success means a real `git ls-remote https://github.com/...` worked.
@@ -51,7 +71,7 @@ Paste a GitHub address and the panel returns the forms this network can open: mi
 
 ## What it cannot do
 
-- **A network that drops the whole GitHub address range is out of reach.** The proxy needs at least one reachable address. When all candidates are reset, the tunnel establishes and the TLS handshake is then cut — measured as 0 reachable addresses out of 50 probed, twice, on a campus network. The panel says so instead of pretending.
+- **A network that drops the whole GitHub address range is out of reach.** The proxy needs at least one reachable address. When every candidate is reset, the proxy closes the tunnel and the browser falls back to a direct attempt, which fails the same way — measured as 0 reachable addresses out of 50 probed, twice, on a campus network. The panel reports the failure instead of pretending.
 - **Accelerator prefixes serve files, not pages.** `github.com` HTML comes back `403`/`404` through them, so browsing the site itself still needs a different network or a network administrator who lifts the block.
 - **No mirror hunting.** Public GitHub web mirrors were probed repeatedly and were all unreachable from the restricted networks this was built on; the panel does not pretend a dead mirror works.
 - **The rewrite is for git only.** Browsers, `curl` and package managers are covered by the proxy instead.
@@ -83,6 +103,7 @@ Routes, all `POST`, all requiring the normal DSH session:
 /api/github-access-guide/revert     remove the rules this plugin installed
 /api/github-access-guide/proxy/on   start the proxy and take over the system settings
 /api/github-access-guide/proxy/off  restore the snapshot and stop the proxy
+/api/github-access-guide/routing    replace the scope: extra sites and full mode
 ```
 
 The split exists because the channel sweep shells out to `git ls-remote` three times,

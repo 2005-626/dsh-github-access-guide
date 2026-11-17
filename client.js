@@ -109,6 +109,25 @@ window.__ModuleLoader__.load({
       },
       proxyLastError: { zh: '最近一次失败', en: 'last failure' },
 
+      routeTitle: { zh: '加速范围', en: 'Acceleration scope' },
+      routeIntro: {
+        zh: '默认只把 GitHub 系站点交给本机代理竞速，其余站点一律直连——代理出问题时也不会连累它们。要加速别的站点就填进下面的列表；想让所有站点都走竞速，打开全站模式。',
+        en: 'By default only GitHub-family sites use the local racing proxy and everything else stays direct, so a proxy problem cannot take other sites down. Add the sites you want raced below, or switch on full mode to race everything.',
+      },
+      routeFull: { zh: '全站模式：其它网站也走本机代理', en: 'Full mode: route every site through the proxy' },
+      routeFullNote: {
+        zh: '全站模式下每个站点都先试本机代理，代理连不上会自动回退直连，代价是比直连多一次失败的往返。',
+        en: 'In full mode every site tries the proxy first and falls back to direct when it cannot connect — one extra failed round trip compared with going direct.',
+      },
+      routeExtra: { zh: '额外加速的站点', en: 'Extra sites to accelerate' },
+      routeExtraHint: {
+        zh: '域名或后缀，用逗号或换行分隔，子域名自动包含；本地地址和局域网地址永远直连。',
+        en: 'Domains or suffixes separated by commas or newlines; subdomains are included. Loopback and LAN addresses always stay direct.',
+      },
+      routeSave: { zh: '保存范围', en: 'Save scope' },
+      routeSaved: { zh: '已保存，下一次请求就按新范围生效', en: 'Saved — the next request uses the new scope' },
+      busySave: { zh: '保存中…', en: 'saving…' },
+
       navFix: { zh: '一键修复', en: 'Repair' },
       navSymptoms: { zh: '症状对照', en: 'Symptoms' },
       navChecks: { zh: '五分钟自查', en: 'Quick checks' },
@@ -320,6 +339,9 @@ window.__ModuleLoader__.load({
       '.ghg-dot[data-ok="0"]{background:var(--dsw-alias-state-error-primary)}',
       '.ghg-grouplabel{font-size:11px;color:var(--dsw-alias-label-secondary);margin:2px 0 4px}',
       '.ghg-actnote{margin:8px 0 0;font-size:12px;line-height:1.6}',
+'.ghg-scope{margin-top:12px;padding-top:12px;border-top:1px solid var(--dsw-alias-border-l1)}',
+'.ghg-scopetoggle{display:flex;gap:8px;align-items:center;cursor:pointer;font-size:13px;font-weight:600}',
+'.ghg-scopetoggle input{width:14px;height:14px;margin:0;accent-color:var(--dsw-alias-brand-primary)}',
       '.ghg-urlbox{border-top:1px solid var(--dsw-alias-border-l1);padding-top:10px}',
       '.ghg-input{box-sizing:border-box;width:100%;font:inherit;font-size:12px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l2);border-radius:7px;padding:6px 10px;margin-top:4px}',
       '.ghg-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}',
@@ -559,6 +581,7 @@ window.__ModuleLoader__.load({
       revert: '/api/github-access-guide/revert',
       proxyOn: '/api/github-access-guide/proxy/on',
       proxyOff: '/api/github-access-guide/proxy/off',
+      routing: '/api/github-access-guide/routing',
     };
 
     async function postJson(path, body) {
@@ -746,6 +769,12 @@ window.__ModuleLoader__.load({
       const [outcome, setOutcome] = React.useState(undefined);
       const [error, setError] = React.useState('');
 
+      /* The scope controls are a draft: they follow the host's value until the user
+       * touches them, so a poll refresh never overwrites what is being typed. */
+      const [draftExtra, setDraftExtra] = React.useState(undefined);
+      const [draftFull, setDraftFull] = React.useState(undefined);
+      const [scopeDone, setScopeDone] = React.useState(false);
+
       /* The proxy card only needs the cheap state (listener, system proxy, git,
        * env). The full status probes every accelerator channel, which can take
        * half a minute on a bad link, so this card never asks for it. */
@@ -801,10 +830,77 @@ window.__ModuleLoader__.load({
       const system = status !== undefined ? status.system : undefined;
       const tools = status !== undefined ? status.tools : undefined;
       const server = proxy !== undefined && proxy.port !== undefined ? '127.0.0.1:' + proxy.port : undefined;
-      const systemOn = system !== undefined && system.enabled === true && server !== undefined && system.server === server;
+      /* Either half of the WinINET takeover proves the machine points here: the PAC URL
+       * is what browsers read, the manual entry is what non-PAC tools read. */
+      const pacOn = system !== undefined && server !== undefined && typeof system.autoConfigURL === 'string'
+        && system.autoConfigURL === 'http://' + server + '/proxy.pac';
+      const systemOn = pacOn
+        || (system !== undefined && system.enabled === true && server !== undefined && system.server === server);
       const gitOn = tools !== undefined && tools.git !== undefined && server !== undefined && tools.git.indexOf(server) !== -1;
       const envOn = tools !== undefined && tools.env !== undefined && server !== undefined
         && (tools.env.HTTPS_PROXY === 'http://' + server || tools.env.HTTP_PROXY === 'http://' + server);
+
+      const routing = proxy !== undefined && proxy.routing !== undefined && proxy.routing !== null
+        ? proxy.routing
+        : { extra: [], full: false };
+      const extraText = draftExtra !== undefined
+        ? draftExtra
+        : (Array.isArray(routing.extra) ? routing.extra.join(', ') : '');
+      const fullOn = draftFull !== undefined ? draftFull : routing.full === true;
+
+      const saveScope = () => {
+        setBusy('scope');
+        setError('');
+        setScopeDone(false);
+        postJson(ROUTES.routing, { extra: extraText, full: fullOn })
+          .then((value) => {
+            setStatus((prev) => (prev === undefined ? prev : Object.assign({}, prev, { proxy: value.proxy })));
+            /* Drop the draft so the controls follow the value the host just stored. */
+            setDraftExtra(undefined);
+            setDraftFull(undefined);
+            setScopeDone(true);
+            setBusy('');
+          })
+          .catch((e) => {
+            setError(String(e && e.message ? e.message : e));
+            setBusy('');
+          });
+      };
+
+      const scopeCard = h('div', { className: 'ghg-scope' },
+        h('div', { className: 'ghg-grouplabel' }, t('routeTitle')),
+        h('p', { className: 'ghg-muted', style: { margin: '0 0 6px', fontSize: '12px', lineHeight: '1.6' } }, t('routeIntro')),
+        h('label', { className: 'ghg-scopetoggle' },
+          h('input', {
+            type: 'checkbox',
+            checked: fullOn,
+            disabled: busy !== '',
+            onChange: (event) => {
+              setScopeDone(false);
+              setDraftFull(event.target.checked);
+            },
+          }),
+          h('span', {}, t('routeFull'))),
+        h('p', { className: 'ghg-actnote ghg-muted', style: { margin: '4px 0 0' } }, t('routeFullNote')),
+        h('label', { className: 'ghg-grouplabel', htmlFor: 'ghg-scope-extra', style: { display: 'block', marginTop: '10px' } }, t('routeExtra')),
+        h('input', {
+          id: 'ghg-scope-extra',
+          className: 'ghg-input',
+          type: 'text',
+          spellCheck: false,
+          placeholder: 'cdn.jsdelivr.net, files.pythonhosted.org',
+          value: extraText,
+          disabled: busy !== '',
+          onChange: (event) => {
+            setScopeDone(false);
+            setDraftExtra(event.target.value);
+          },
+        }),
+        h('p', { className: 'ghg-actnote ghg-muted', style: { margin: '4px 0 0' } }, t('routeExtraHint')),
+        h('div', { style: { marginTop: '8px', display: 'flex', gap: '10px', alignItems: 'center' } },
+          h('button', { type: 'button', className: 'ghg-act', disabled: busy !== '', onClick: saveScope },
+            busy === 'scope' ? t('busySave') : t('routeSave')),
+          scopeDone === true ? h('span', { className: 'ghg-muted', style: { fontSize: '12px' } }, t('routeSaved')) : null));
 
       const btn = (kind, label, handler, primary) => h('button', {
         type: 'button',
@@ -871,6 +967,7 @@ window.__ModuleLoader__.load({
             btn('proxyOff', t('btnProxyOff'), () => run('proxyOff', ROUTES.proxyOff), false))),
         h('p', { className: 'ghg-muted', style: { margin: '0 0 10px' } }, t('proxyIntro')),
         rows.length > 0 ? h('div', { className: 'ghg-statusbox' }, rows) : null,
+        scopeCard,
         winnerRows.length > 0
           ? h('div', { className: 'ghg-statusbox' },
             h('div', { className: 'ghg-grouplabel' }, t('proxyWinners')), winnerRows)

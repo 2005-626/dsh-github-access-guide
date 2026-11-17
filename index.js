@@ -22,10 +22,13 @@
  * use for panel-to-host actions.
  */
 import { execFile } from 'node:child_process'
+import { promises as fs } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { promisify } from 'node:util'
 import { connect as tlsConnect } from 'node:tls'
 import { request as httpsRequest } from 'node:https'
-import { createProxy, DEFAULT_PORT } from './proxy.js'
+import { createProxy, DEFAULT_PORT, normalizeRouting } from './proxy.js'
 import { engage, restore, readSnapshot, readSystemProxy, readToolProxy } from './system-proxy.js'
 
 const execFileAsync = promisify(execFile)
@@ -453,6 +456,97 @@ async function clearOwnedRewrites() {
 
 const proxyInstance = createProxy({ port: DEFAULT_PORT })
 
+/* ------------------------------------------------------------------ */
+/* routing settings                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Where the panel's "extra domains" list and full-mode switch are remembered.
+ *
+ * Deliberately not inside proxy-state.json: that file records what the machine looked
+ * like before the takeover and is deleted by `restore()`, while this is a preference
+ * that has to survive a restore and a restart.
+ */
+function settingsPath() {
+  const home = process.env.DSH_HOME && process.env.DSH_HOME.length > 0
+    ? process.env.DSH_HOME
+    : path.join(os.homedir(), '.dsh')
+  return path.join(home, 'github-access-guide', 'settings.json')
+}
+
+let routing = normalizeRouting({})
+
+/** Read the preference once per load; a missing or broken file means "defaults". */
+async function loadRouting() {
+  try {
+    routing = normalizeRouting(JSON.parse(await fs.readFile(settingsPath(), 'utf8')))
+  } catch {
+    routing = normalizeRouting({})
+  }
+  proxyInstance.setRouting(routing)
+  return routing
+}
+
+/**
+ * Change the routing table and persist it.
+ *
+ * Unknown fields are ignored and a bad entry is dropped rather than rejected: the panel
+ * writes what the user typed, and a typo in one domain should not discard the rest.
+ */
+async function saveRouting(patch) {
+  const source = patch !== null && typeof patch === 'object' ? patch : {}
+  const next = normalizeRouting({
+    extra: source.extra !== undefined ? source.extra : routing.extra,
+    full: source.full !== undefined ? source.full === true : routing.full,
+  })
+  routing = next
+  proxyInstance.setRouting(next)
+  try {
+    const file = settingsPath()
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    await fs.writeFile(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  } catch {
+    /* a read-only home still works for this session */
+  }
+  return { routing: next, proxy: proxyInstance.snapshot() }
+}
+
+/* ------------------------------------------------------------------ */
+/* watchdog                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Put the machine's proxy settings back the moment the listener disappears.
+ *
+ * The system proxy points at a loopback port, so a listener that died while the setting
+ * survived turns *every* site into a browser error — the exact failure this plugin is
+ * supposed to prevent. The host process is what can die, so as long as it is alive this
+ * timer is the difference between one broken browser request and a permanently broken
+ * one.
+ */
+const WATCHDOG_MS = 15_000
+
+async function checkProxyHealth() {
+  if (proxyInstance.snapshot().running === true) return { action: 'ok' }
+  const system = await readSystemProxy()
+  const pacOwned = typeof system.autoConfigURL === 'string'
+    ? /^http:\/\/127\.0\.0\.1:\d+\/proxy\.pac$/u.test(system.autoConfigURL.trim())
+    : false
+  const manualOwned = system.enabled === true && typeof system.server === 'string'
+    ? /^127\.0\.0\.1:\d+$/u.test(system.server.trim())
+    : false
+  if (pacOwned !== true && manualOwned !== true) return { action: 'none' }
+
+  const restored = await restore()
+  /* Without a snapshot `restore()` only knows about WinINET's enable flag, so a PAC URL
+   * written by an install whose snapshot was lost has to be removed here. */
+  const after = await readSystemProxy()
+  if (typeof after.autoConfigURL === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/proxy\.pac$/u.test(after.autoConfigURL.trim())) {
+    await execFileAsync('reg', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'AutoConfigURL', '/f'], { windowsHide: true, timeout: 10_000 }).catch(() => {})
+  }
+  return { action: 'restored', system: await readSystemProxy(), tools: restored.tools }
+}
+
 /**
  * Start the local proxy and point the system at it.
  *
@@ -471,8 +565,11 @@ async function engageProxy() {
    * the plain URL works, so drop the rewrite this plugin installed. */
   const cleared = await clearOwnedRewrites()
   return {
-    engaged: applied.system.enabled === true && applied.system.server === applied.server,
+    /* The PAC is what browsers obey, so that is the value that proves the takeover
+     * happened — `ProxyServer` alone can be stale from an older install. */
+    engaged: applied.system.autoConfigURL === applied.pac,
     server: applied.server,
+    pac: applied.pac,
     steps: applied.steps,
     clearedRewrites: cleared.removed,
     proxy: proxyInstance.snapshot(),
@@ -506,7 +603,16 @@ async function reconcileOnStart() {
     const match = /^http:\/\/127\.0\.0\.1:(\d+)\/?$/u.exec(value.trim())
     return match === null ? undefined : Number(match[1])
   }
-  const systemPort = system.enabled === true ? loopbackPort(`http://${String(system.server || '')}`) : undefined
+  const pacPort = (value) => {
+    if (typeof value !== 'string') return undefined
+    const match = /^http:\/\/127\.0\.0\.1:(\d+)\/proxy\.pac$/u.exec(value.trim())
+    return match === null ? undefined : Number(match[1])
+  }
+  /* The PAC URL is the current form of the takeover; the manual server value is what
+   * older installs wrote, and it still has to be recognised so an upgrade cleans up. */
+  const pacOwned = system.autoConfigURL !== undefined ? pacPort(system.autoConfigURL) : undefined
+  const manualOwned = system.enabled === true ? loopbackPort(`http://${String(system.server || '')}`) : undefined
+  const systemPort = pacOwned !== undefined ? pacOwned : manualOwned
   const gitPort = loopbackPort(tools.git)
   const envPort = loopbackPort(tools.env && (tools.env.HTTPS_PROXY || tools.env.HTTP_PROXY))
   const leftHere = systemPort !== undefined || gitPort !== undefined || envPort !== undefined
@@ -550,6 +656,7 @@ function routePaths(ns) {
     revert: `/api/${ns}/revert`,
     proxyOn: `/api/${ns}/proxy/on`,
     proxyOff: `/api/${ns}/proxy/off`,
+    routing: `/api/${ns}/routing`,
   })
 }
 
@@ -590,6 +697,7 @@ export function registerRoutes(webServer) {
   endpoint(paths.revert, () => clearOwnedRewrites())
   endpoint(paths.proxyOn, () => engageProxy())
   endpoint(paths.proxyOff, () => disengageProxy())
+  endpoint(paths.routing, (body) => saveRouting(body))
   return offs
 }
 
@@ -620,7 +728,18 @@ export function apply(ctx) {
   /* A system proxy pointing at a loopback port that nothing listens on breaks every
    * browser request, so this must not wait for the user to open the panel. It runs
    * once per load and never throws into the loader. */
-  reconcileOnStart().catch(() => {})
+  loadRouting()
+    .catch(() => {})
+    .then(() => reconcileOnStart())
+    .catch(() => {})
+
+  /* The snapshot above only repairs a *restart*. If the listener dies while the host is
+   * still running, this timer is what stops a dead port from breaking every site. */
+  const watchdog = setInterval(() => {
+    checkProxyHealth().catch(() => {})
+  }, WATCHDOG_MS)
+  if (typeof watchdog.unref === 'function') watchdog.unref()
+  ctx.effect(() => () => clearInterval(watchdog), `${NS}: proxy watchdog`)
 
   return {
     status: collectStatus,
@@ -631,5 +750,7 @@ export function apply(ctx) {
     revert: clearOwnedRewrites,
     proxyOn: engageProxy,
     proxyOff: disengageProxy,
+    routing: () => routing,
+    setRouting: saveRouting,
   }
 }

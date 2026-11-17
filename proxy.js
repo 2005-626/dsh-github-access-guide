@@ -29,6 +29,14 @@ const CACHE_TTL_MS = 60_000
 /** Shorter reuse for the seed-only answer handed out before DNS comes back. */
 const FAST_TTL_MS = 5_000
 const DIAL_TIMEOUT_MS = 6_000
+/**
+ * Budget for hosts this plugin has no opinion about.
+ *
+ * Slightly longer than the GitHub race: there is no TLS pre-flight here, so this is
+ * the only wait before the browser learns the site is unreachable, and a slow site
+ * deserves more grace than a known-bad GitHub address.
+ */
+const FORWARD_TIMEOUT_MS = 8_000
 const SUSPECT_MS = 45_000
 /** How long a handshake-verified address is trusted before it is checked again. */
 const HEALTHY_TTL_MS = 120_000
@@ -58,6 +66,137 @@ const POOL = Object.freeze({
 })
 
 const GITHUB_HOSTS = new Set(Object.keys(POOL))
+
+/** Path the proxy serves its PAC file on. Browsers fetch it to decide who we carry. */
+export const PAC_PATH = '/proxy.pac'
+
+/**
+ * Host suffixes the PAC routes here, in addition to the exact pool hosts.
+ *
+ * Sending only GitHub to this proxy matters because it is installed as the *system*
+ * proxy: every other site would otherwise pay a round trip through a Node process and
+ * receive our 502 when it is unreachable, which is how an unrelated site turns into
+ * `ERR_TUNNEL_CONNECTION_FAILED`.
+ */
+const PAC_SUFFIXES = Object.freeze([
+  'github.com',
+  'githubusercontent.com',
+  'githubassets.com',
+  'github.io',
+  'githubapp.com',
+  'ghcr.io',
+])
+
+/**
+ * Reduce whatever the panel stored to the shape the PAC and the racer both use.
+ *
+ * A pasted URL is accepted as-is: scheme, credentials, port and path are stripped so
+ * the user can copy something out of the address bar instead of editing it first.
+ * Entries are matched exact-or-suffix, the same rule the built-in GitHub list follows,
+ * which is what makes "add jsdelivr.net" cover cdn.jsdelivr.net as well.
+ */
+export function normalizeRouting(input) {
+  const raw = input !== null && typeof input === 'object' ? input : {}
+  const source = Array.isArray(raw.extra)
+    ? raw.extra
+    : typeof raw.extra === 'string' ? raw.extra.split(/[\s,;]+/u) : []
+  const extra = []
+  for (const entry of source) {
+    if (typeof entry !== 'string') continue
+    let host = entry.trim().toLowerCase()
+    host = host.replace(/^[a-z][a-z0-9+.-]*:\/\//u, '').replace(/^[^/@]*@/u, '')
+    host = host.split(/[/?#]/u)[0].replace(/:\d+$/u, '').replace(/^\.+|\.+$/gu, '')
+    if (host.startsWith('*.')) host = host.slice(2)
+    if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/u.test(host) !== true) continue
+    if (extra.includes(host) !== true) extra.push(host)
+  }
+  return { extra, full: raw.full === true }
+}
+
+/** True when `host` is `suffix` itself or a subdomain of it. */
+export function matchesSuffix(host, suffix) {
+  if (typeof host !== 'string' || typeof suffix !== 'string' || suffix === '') return false
+  if (host === suffix) return true
+  return host.length > suffix.length && host.slice(-(suffix.length + 1)) === `.${suffix}`
+}
+
+/** Is this one of the GitHub-family hosts the handshake pre-flight was designed for? */
+export function githubHost(host) {
+  if (typeof host !== 'string' || host === '') return false
+  if (GITHUB_HOSTS.has(host)) return true
+  for (const suffix of PAC_SUFFIXES) if (matchesSuffix(host, suffix)) return true
+  return false
+}
+
+/** Is this a host the racer takes responsibility for (pre-flight + seed + race)? */
+export function racedHost(routing, host) {
+  if (typeof host !== 'string' || host === '') return false
+  if (GITHUB_HOSTS.has(host)) return true
+  for (const suffix of PAC_SUFFIXES) if (matchesSuffix(host, suffix)) return true
+  for (const suffix of routing.extra) if (matchesSuffix(host, suffix)) return true
+  return false
+}
+
+/**
+ * The PAC script a browser evaluates for every request.
+ *
+ * Deliberately ES3-ish and dependency-free: `shExpMatch`/`dnsDomainIs` are not
+ * implemented identically by every engine, while plain string comparison is. DNS is
+ * never consulted here — resolving a poisoned name inside a PAC would stall the page.
+ *
+ * Two details exist for the sites that are *not* GitHub:
+ *
+ *   `; DIRECT`   This listener is the system proxy, so when it is restarting, busy or
+ *                gone, a bare `PROXY` answer turns every site into a browser error
+ *                page. Naming DIRECT as the second choice sends the browser straight
+ *                to the network instead.
+ *   full mode    Optional, off by default: carry everything that is not local, so the
+ *                same racing resolver fixes sites beyond GitHub.
+ */
+export function buildPac(port, routingInput) {
+  const routing = normalizeRouting(routingInput)
+  const target = `PROXY 127.0.0.1:${port}; DIRECT`
+  const exact = [...new Set([...GITHUB_HOSTS, ...routing.extra])]
+  const suffixes = [...new Set([...PAC_SUFFIXES, ...routing.extra])]
+  const lines = [
+    'function isPrivateLiteral(host) {',
+    '  var parts = host.split(".");',
+    '  if (parts.length !== 4) return false;',
+    '  for (var i = 0; i < 4; i += 1) {',
+    '    var n = Number(parts[i]);',
+    '    if (String(n) !== parts[i] || n < 0 || n > 255) return false;',
+    '  }',
+    '  var a = Number(parts[0]);',
+    '  var b = Number(parts[1]);',
+    '  if (a === 0 || a === 10 || a === 127) return true;',
+    '  if (a === 169 && b === 254) return true;',
+    '  if (a === 172 && b >= 16 && b <= 31) return true;',
+    '  if (a === 192 && b === 168) return true;',
+    '  if (a === 100 && b >= 64 && b <= 127) return true;',
+    '  return false;',
+    '}',
+    'function FindProxyForURL(url, host) {',
+    `  var target = ${JSON.stringify(target)};`,
+    '  if (typeof host !== "string" || host.length === 0) return "DIRECT";',
+    '  host = host.toLowerCase();',
+    '  if (host === "localhost") return "DIRECT";',
+    '  if (host.indexOf(".") === -1 || host.slice(-6) === ".local") return "DIRECT";',
+    '  if (host.indexOf(":") !== -1 || isPrivateLiteral(host)) return "DIRECT";',
+    `  var exact = ${JSON.stringify(exact)};`,
+    `  var suffixes = ${JSON.stringify(suffixes)};`,
+    '  for (var i = 0; i < exact.length; i += 1) {',
+    '    if (host === exact[i]) return target;',
+    '  }',
+    '  for (var j = 0; j < suffixes.length; j += 1) {',
+    '    var suffix = suffixes[j];',
+    '    if (host === suffix) return target;',
+    '    if (host.length > suffix.length && host.slice(-(suffix.length + 1)) === "." + suffix) return target;',
+    '  }',
+    routing.full === true ? '  return target;' : '  return "DIRECT";',
+    '}',
+  ]
+  return lines.join('\n') + '\n'
+}
 
 /** Hosts the panel reports about; racing applies to every host, this is just the summary. */
 export const WATCHED_HOSTS = Object.freeze([
@@ -211,6 +350,8 @@ function dialRace(addresses, port, timeoutMs) {
  */
 export function createProxy(options = {}) {
   const preferredPort = Number.isInteger(options.port) ? options.port : DEFAULT_PORT
+  /** Who the PAC routes here and who the racer owns; owned by the panel. */
+  let routing = normalizeRouting(options.routing)
   const cache = new Map()
   /** @type {Map<string, number>} address -> epoch ms until which it is deprioritised */
   const suspect = new Map()
@@ -225,6 +366,7 @@ export function createProxy(options = {}) {
     port: undefined,
     connections: 0,
     tunnels: 0,
+    forwarded: 0,
     failures: 0,
     probes: 0,
     probeOk: 0,
@@ -245,9 +387,10 @@ export function createProxy(options = {}) {
       if (parsed === null || typeof parsed !== 'object') return
       for (const [host, list] of Object.entries(parsed)) {
         if (Array.isArray(list) === false) continue
-        /* Skip entries written by an older build that seeded every host it saw. */
-        if (GITHUB_HOSTS.has(host) !== true) continue
-        const clean = list.filter((entry) => typeof entry === 'string' && /^\d+\.\d+\.\d+\.\d+$/u.test(entry))
+        /* Skip entries written by an older build that seeded every host it saw: only
+         * the hosts the racer owns are worth restoring. */
+        if (racedHost(routing, host) !== true) continue
+        const clean = list.filter((entry) => typeof entry === 'string' && net.isIP(entry) !== 0)
         if (clean.length > 0) seed.set(host, clean.slice(0, 5))
       }
     } catch {
@@ -275,48 +418,67 @@ export function createProxy(options = {}) {
 
   function noteWinner(host, address) {
     if (typeof host !== 'string' || typeof address !== 'string') return
-    /* Only the GitHub hosts are worth remembering: this proxy carries every site the
-     * machine loads, and a seed full of unrelated CDNs says nothing useful. */
-    if (GITHUB_HOSTS.has(host) !== true) return
+    /* Only the hosts the racer owns are worth remembering: this proxy can carry every
+     * site the machine loads, and a seed full of unrelated CDNs says nothing useful. */
+    if (racedHost(routing, host) !== true) return
     const list = seed.get(host) || []
     const next = [address].concat(list.filter((entry) => entry !== address)).slice(0, 5)
     seed.set(host, next)
     scheduleSeedSave()
   }
 
-  /** Ask the system resolver, then two public ones, for v4 addresses of `host`. */
+  /**
+   * Ask the system resolver, then two public ones, for addresses of `host`.
+   *
+   * Both families are collected, IPv4 first. A machine with IPv6 routing only as far
+   * as its own switch still advertises AAAA for everything, so racing a dead v6
+   * address against a working v4 one would turn a fast site into a timeout; ordering
+   * is enough to avoid that because `dialRace` keeps whichever connects first.
+   */
   async function lookupAll(host) {
-    const found = []
-    const push = (address) => {
-      if (typeof address === 'string' && /^\d+\.\d+\.\d+\.\d+$/u.test(address) && !found.includes(address)) found.push(address)
+    const v4 = []
+    const v6 = []
+    const push4 = (address) => {
+      if (typeof address === 'string' && net.isIPv4(address) === true && v4.includes(address) !== true) v4.push(address)
+    }
+    const push6 = (address) => {
+      if (typeof address === 'string' && net.isIPv6(address) === true && v6.includes(address) !== true) v6.push(address)
     }
     try {
-      for (const address of await dns.resolve4(host)) push(address)
+      for (const address of await dns.resolve4(host)) push4(address)
     } catch {
       /* fall through to lookup below */
     }
-    if (found.length === 0) {
-      /* resolve4 skips the hosts file and CNAME chains the resolver will not flatten;
-       * lookup covers both. */
+    try {
+      for (const address of await dns.resolve6(host)) push6(address)
+    } catch {
+      /* an AAAA record is optional; v4-only names are still the common case */
+    }
+    if (v4.length === 0 || v6.length === 0) {
+      /* resolve4/resolve6 skip the hosts file and CNAME chains the resolver will not
+       * flatten; lookup covers both, for both families in one call. */
       try {
-        for (const entry of await dns.lookup(host, { all: true, family: 4 })) push(entry.address)
+        for (const entry of await dns.lookup(host, { all: true, family: 0 })) {
+          if (entry.family === 6) push6(entry.address)
+          else push4(entry.address)
+        }
       } catch {
         /* the system resolver itself is the broken part */
       }
     }
-    if (found.length === 0) {
+    if (v4.length === 0) {
       const resolver = new Resolver({ timeout: 2_000, tries: 1 })
       resolver.setServers(FALLBACK_DNS)
       try {
-        for (const address of await resolver.resolve4(host)) push(address)
+        for (const address of await resolver.resolve4(host)) push4(address)
       } catch {
         /* nothing left to try; the pool still gets us there */
       }
     }
-    return found
+    return [...v4, ...v6]
   }
 
-  function compose(host, resolved) {
+  function compose(host, resolved, limit = 6) {
     const found = []
     for (const address of seed.get(host) || []) if (!found.includes(address)) found.push(address)
     for (const address of resolved) if (!found.includes(address)) found.push(address)
@@ -325,7 +487,7 @@ export function createProxy(options = {}) {
     // Addresses that recently accepted a tunnel and then reset it go last, but stay
     // in the race: a network change can make yesterday's bad address the best one.
     const ordered = found.slice().sort((a, b) => (suspect.get(a) || 0) - (suspect.get(b) || 0))
-    return ordered.slice(0, 6)
+    return ordered.slice(0, limit)
   }
 
   async function resolveCandidates(host) {
@@ -382,7 +544,7 @@ export function createProxy(options = {}) {
     })
 
     const teardown = () => {
-      if (carried === 0 && Date.now() - started < SUSPECT_MAX_LIFETIME_MS) noteSuspect(address)
+      if (carried === 0 && Date.now() - started < SUSPECT_MAX_LIFETIME_MS && racedHost(routing, host) === true) noteSuspect(address)
     }
     upstream.on('error', () => {
       teardown()
@@ -434,8 +596,22 @@ export function createProxy(options = {}) {
     if (cached !== undefined && cached.expires > Date.now()) return cached.address
     const candidates = await resolveCandidates(host)
     if (candidates.length === 0) return undefined
-    const raced = await raceTls(candidates, host, PROBE_TIMEOUT_MS)
+    let raced = await raceTls(candidates, host, PROBE_TIMEOUT_MS)
     stats.probes += 1
+    /* Six is the right width for a *dial* — the browser is waiting — but it is a poor
+     * sample to search with: when a network blocks most of a host's addresses, the six
+     * least-suspect ones can all be dead while the seventh works. So a failed probe
+     * widens to every known address for that host before it gives up, and the winner
+     * is remembered for the next 120 s like any other. */
+    if (raced.ok !== true) {
+      const wide = compose(host, await lookupAll(host).catch(() => []), 24)
+      const rest = wide.filter((address) => candidates.includes(address) !== true)
+      if (rest.length > 0) {
+        const wider = await raceTls(rest, host, PROBE_TIMEOUT_MS)
+        stats.probes += 1
+        raced = { ...wider, results: [...raced.results, ...wider.results] }
+      }
+    }
     for (const result of raced.results) {
       if (result.ok === true) {
         stats.probeOk += 1
@@ -451,16 +627,70 @@ export function createProxy(options = {}) {
     return undefined
   }
 
+  /**
+   * Pass a non-GitHub host straight through: one parallel dial on its own DNS
+   * answers, then a plain byte pipe.
+   *
+   * No TLS pre-flight, no seed, no second round — none of that knowledge is useful
+   * for a site we are not trying to reroute, and each would only add delay to a page
+   * that is going to load or fail on its own terms.
+   */
+  async function forwardTunnel(client, host, port) {
+    const candidates = await lookupAll(host)
+    const upstream = await dialRace(candidates, port, FORWARD_TIMEOUT_MS)
+    if (upstream.ok !== true) {
+      failTunnel(client, host, port, upstream.error)
+      return
+    }
+    stats.forwarded += 1
+    pipe(client, upstream.socket, upstream.address, host)
+  }
+
+  /**
+   * Give up on a tunnel by *closing* it instead of answering 502.
+   *
+   * A PAC answer of `PROXY …; DIRECT` only walks to the second entry when the proxy
+   * connection itself fails; an HTTP error response is a final answer. That is why the
+   * old 502 surfaced as ERR_TUNNEL_CONNECTION_FAILED on pages that would have loaded
+   * fine over a direct connection. Dropping the socket hands the request back to
+   * DIRECT, which makes a site this proxy cannot reach exactly as reachable as it is
+   * with no proxy at all.
+   */
+  function failTunnel(client, host, port, reason) {
+    stats.failures += 1
+    stats.lastError = `${host}:${port} ${reason}`
+    try {
+      client.destroy()
+    } catch {
+      /* already gone */
+    }
+  }
+
   async function handleConnect(client, first, host, port) {
     client.__startedAt = Date.now()
     stats.connections += 1
+
+    /* This listener is installed as the *system* proxy, so every site the machine
+     * loads can arrive here, not just the ones this plugin is about. Answering 502 to
+     * the rest (the old behaviour) turned one unreachable site into a broken browser:
+     * Chromium renders that 502 as ERR_TUNNEL_CONNECTION_FAILED on pages that were
+     * never the problem. Anything the racer does not own is therefore forwarded
+     * verbatim, which keeps it exactly as reachable as it would be with no proxy. */
+    if (racedHost(routing, host) !== true) {
+      await forwardTunnel(client, host, port)
+      return
+    }
 
     let probedAll = false
     /* Port 443 is TLS, so we can check that the handshake really completes before
      * handing the browser a tunnel — but only for the hosts that actually go wrong
      * here. Probing every HTTPS host would add a round trip to every unrelated site
      * that shares this proxy, so everything else stays a plain TCP race. */
-    if (port === 443 && GITHUB_HOSTS.has(host)) {
+    /* The handshake pre-flight only pays for itself on the GitHub hosts it was built
+     * for: there, blocked addresses accept the TCP connection and then reset the
+     * handshake, so a cheap probe rejects them before the browser is handed a dead
+     * tab. A site the user added has no such history. */
+    if (port === 443 && githubHost(host) === true) {
       const healthyAddress = await resolveHealthy(host)
       if (healthyAddress !== undefined) {
         const direct = await dialRace([healthyAddress], port, DIAL_TIMEOUT_MS)
@@ -481,6 +711,16 @@ export function createProxy(options = {}) {
      * rounds only turn a fast failure into a long hang: the browser is going to see a
      * dead page either way. One short round is enough to notice a blip, and the next
      * request probes again because failures are never cached. */
+    /* Every known address for this host already failed a real handshake. A TCP race
+     * can still "win" against an address that accepts the connection and then resets
+     * it, which hands the browser a dead tab and makes it wait for a TLS timeout. With
+     * a DIRECT fallback the browser can do better on its own, and immediately: close
+     * the tunnel instead. In full mode nothing else would answer, so the race stays. */
+    if (probedAll === true && routing.full !== true) {
+      failTunnel(client, host, port, 'no-address-passed-tls')
+      return
+    }
+
     const dialBudget = probedAll === true ? Math.min(DIAL_TIMEOUT_MS, 2_500) : DIAL_TIMEOUT_MS
     const candidates = await resolveCandidates(host)
     let upstream = await dialRace(candidates, port, dialBudget)
@@ -490,9 +730,7 @@ export function createProxy(options = {}) {
       upstream = await dialRace(fresh, port, DIAL_TIMEOUT_MS)
     }
     if (upstream.ok !== true) {
-      stats.failures += 1
-      stats.lastError = `${host}:${port} ${upstream.error}`
-      client.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+      failTunnel(client, host, port, upstream.error)
       return
     }
     pipe(client, upstream.socket, upstream.address, host)
@@ -505,9 +743,7 @@ export function createProxy(options = {}) {
     const candidates = await resolveCandidates(host)
     const upstream = await dialRace(candidates, port, DIAL_TIMEOUT_MS)
     if (upstream.ok !== true) {
-      stats.failures += 1
-      stats.lastError = `${host}:${port} ${upstream.error}`
-      client.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+      failTunnel(client, host, port, upstream.error)
       return
     }
     const socket = upstream.socket
@@ -549,6 +785,20 @@ export function createProxy(options = {}) {
     client.pipe(socket)
   }
 
+  /** Serve the PAC script the browser asks for once it is pointed at this address. */
+  function servePac(client, head) {
+    const body = buildPac(stats.port, routing)
+    const headOnly = /^HEAD\s/u.test(head)
+    client.end(
+      'HTTP/1.1 200 OK\r\n'
+      + 'Content-Type: application/x-ns-proxy-autoconfig\r\n'
+      + 'Cache-Control: no-cache, no-store\r\n'
+      + `Content-Length: ${Buffer.byteLength(body)}\r\n`
+      + 'Connection: close\r\n\r\n'
+      + (headOnly ? '' : body),
+    )
+  }
+
   function onConnection(client) {
     client.on('error', () => {})
     client.once('data', (first) => {
@@ -563,6 +813,11 @@ export function createProxy(options = {}) {
             /* already gone */
           }
         })
+        return
+      }
+      const origin = /^(?:GET|HEAD)\s+(\/[^\s]*)\s+HTTP\/1\.[01]/i.exec(head)
+      if (origin !== null && origin[1].split('?')[0] === PAC_PATH) {
+        servePac(client, head)
         return
       }
       const absolute = /^(?:GET|HEAD|POST|PUT|DELETE|OPTIONS|PATCH)\s+http:\/\/([^/\s:]+)(?::(\d+))?/i.exec(head)
@@ -637,6 +892,7 @@ export function createProxy(options = {}) {
       startedAt: stats.startedAt,
       connections: stats.connections,
       tunnels: stats.tunnels,
+      forwarded: stats.forwarded,
       failures: stats.failures,
       tlsProbes: stats.probes,
       tlsProbesOk: stats.probeOk,
@@ -650,8 +906,20 @@ export function createProxy(options = {}) {
       healthy: [...healthy.entries()].filter(([, entry]) => entry.expires > Date.now()).map(([host, entry]) => ({ host, address: entry.address })),
       watchedHosts: WATCHED_HOSTS,
       githubHosts: [...GITHUB_HOSTS],
+      routing: { extra: routing.extra.slice(), full: routing.full },
     }
   }
 
-  return { start, stop, snapshot, preferredPort }
+  /**
+   * Replace the routing table.
+   *
+   * The PAC is rebuilt per request and the browser re-reads it on its own schedule, so
+   * nothing has to be restarted; the resolver cache is keyed by host and stays valid.
+   */
+  function setRouting(next) {
+    routing = normalizeRouting(next)
+    return { extra: routing.extra.slice(), full: routing.full }
+  }
+
+  return { start, stop, snapshot, setRouting, preferredPort }
 }

@@ -19,12 +19,31 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
+import { PAC_PATH } from './proxy.js'
 
 const execFileAsync = promisify(execFile)
 
 const INTERNET_SETTINGS = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
 const ENVIRONMENT_KEY = 'HKCU\\Environment'
+/* Values that only this plugin ever writes: a PAC URL or a manual proxy pointing at
+ * loopback. They are recognised so a leftover can be removed even when the snapshot is
+ * gone, which is the only way to guarantee that no browser is left fetching a PAC from
+ * a port that stopped listening. */
+const LOOPBACK_PAC = /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+\/proxy\.pac\/?$/iu
+const LOOPBACK_APEX = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost):\d+(?:[;,]|$)/iu
 const PROXY_OVERRIDE = 'localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>'
+
+/**
+ * The URL the browser fetches its proxy decision from.
+ *
+ * Manual `ProxyServer` cannot express "only these hosts": Windows' `ProxyOverride` is
+ * a *bypass* list, so with it the machine sends everything here and every unreachable
+ * site comes back as this plugin's 502. A PAC script is the only non-elevated way to
+ * describe a whitelist, and it also means unrelated traffic never enters this process.
+ */
+export function pacUrl(port) {
+  return `http://127.0.0.1:${port}${PAC_PATH}`
+}
 
 async function reg(...args) {
   try {
@@ -211,6 +230,11 @@ export async function engage(port) {
   steps.wininet = await writeDword(INTERNET_SETTINGS, 'ProxyEnable', 1)
   steps.server = await writeString(INTERNET_SETTINGS, 'ProxyServer', server)
   steps.override = await writeString(INTERNET_SETTINGS, 'ProxyOverride', PROXY_OVERRIDE)
+  /* The PAC is what browsers actually obey, so it is written last and only after the
+   * manual settings are in place: if the script cannot be fetched they fall back to
+   * these, which still work because the proxy forwards what it is not racing. */
+  const pac = pacUrl(port)
+  steps.pac = await writeString(INTERNET_SETTINGS, 'AutoConfigURL', pac)
   steps.notified = await notifyProxyChange()
 
   steps.git = (await gitSet('http.proxy', `http://${server}`)) && (await gitSet('https.proxy', `http://${server}`))
@@ -220,7 +244,7 @@ export async function engage(port) {
     if ((await writeString(ENVIRONMENT_KEY, name, `http://${server}`)) !== true) steps.env = false
   }
 
-  return { server, steps, snapshot: state, system: await readSystemProxy(), tools: await readToolProxy() }
+  return { server, pac, steps, snapshot: state, system: await readSystemProxy(), tools: await readToolProxy() }
 }
 
 /**
@@ -247,9 +271,12 @@ export async function restore() {
     if (wininet.override !== undefined) {
       steps.override = await writeString(INTERNET_SETTINGS, 'ProxyOverride', wininet.override)
     }
-    if (wininet.autoConfigURL !== undefined) {
-      steps.autoConfigURL = await writeString(INTERNET_SETTINGS, 'AutoConfigURL', wininet.autoConfigURL)
-    }
+    /* The PAC URL belongs to this plugin, so "there was none" has to mean *remove* it:
+     * leaving it behind points every browser at a port that will stop listening, and
+     * that is precisely the broken state this module exists to avoid. */
+    steps.autoConfigURL = wininet.autoConfigURL === undefined
+      ? await deleteValue(INTERNET_SETTINGS, 'AutoConfigURL')
+      : await writeString(INTERNET_SETTINGS, 'AutoConfigURL', wininet.autoConfigURL)
     steps.notified = await notifyProxyChange()
 
     const git = state.git || {}
@@ -269,8 +296,18 @@ export async function restore() {
       if (ok !== true) steps.env = false
     }
   } else {
-    // No snapshot means we never engaged; just make sure the system proxy is off.
+    /* No snapshot means we have no record of what was there before. Turning the flag off is
+     * not enough: a PAC URL or manual proxy still pointing at a loopback port keeps every
+     * browser pointed at a server that is about to stop listening, and a failed PAC fetch
+     * looks like a broken internet. Loopback values are ours by definition, so they go. */
     steps.enabled = await writeDword(INTERNET_SETTINGS, 'ProxyEnable', 0)
+    const live = await readSystemProxy()
+    steps.autoConfigURL = live.autoConfigURL !== undefined && LOOPBACK_PAC.test(live.autoConfigURL) === true
+      ? await deleteValue(INTERNET_SETTINGS, 'AutoConfigURL')
+      : true
+    steps.server = live.server !== undefined && LOOPBACK_APEX.test(live.server) === true
+      ? await deleteValue(INTERNET_SETTINGS, 'ProxyServer')
+      : true
     steps.notified = await notifyProxyChange()
     await gitUnset('http.proxy')
     await gitUnset('https.proxy')
