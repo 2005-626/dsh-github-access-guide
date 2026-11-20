@@ -1,6 +1,6 @@
 {
   "name": "dsh-github-access-guide",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "private": false,
   "type": "module",
   "description": "Sidebar panel that repairs GitHub access on restricted networks: a local racing proxy that takes over the Windows system proxy (reversibly) through a PAC with a DIRECT fallback, an adjustable acceleration scope (extra sites or full mode) so other sites can be raced too, a verified git accelerator rewrite, live channel status, and a URL converter.",

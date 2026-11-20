@@ -37,15 +37,6 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Require the tag to exist
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          if ! git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
-            echo "::error::tag $TAG does not exist; push it before running this workflow"
-            exit 1
-          fi
-
       - name: Skip when the release already exists
         id: probe
         env:

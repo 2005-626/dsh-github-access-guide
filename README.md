@@ -65,6 +65,8 @@ Windows answers a PAC request from its own cache keyed on the **URL**, so rewrit
 
 **Repair** tries the accelerator channels in order, installs `git config --global url.<prefix>.insteadOf https://github.com/`, and then verifies with the **plain** GitHub URL — the one you actually type. A channel that installs but does not verify is removed before the next one is tried, so a reported success means a real `git ls-remote https://github.com/...` worked.
 
+Both the probe and the verification retry, up to three attempts. Some accelerators are reachable only intermittently: one prefix answered two of ten identical `ls-remote` calls and reset the rest on the campus network this was built for. A single attempt reported that channel as unusable even though it worked, so a retry is the honest test and the panel shows the attempt count when it took more than one.
+
 **Undo repair** removes only the rules this plugin installed and leaves any rewrite of your own alone. Repair refuses to run while the proxy is engaged, because stacking the two sends git through an accelerator *and* through the proxy.
 
 ## URL converter

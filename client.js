@@ -51,6 +51,7 @@ window.__ModuleLoader__.load({
       chBad: { zh: '不可用', en: 'fails' },
       chGitOk: { zh: 'git 可用', en: 'git ok' },
       chGitNo: { zh: 'git 不可用', en: 'git down' },
+      chTries: { zh: ' 次试通', en: 'tries' },
       chFileOk: { zh: '文件可用', en: 'files ok' },
       chFileNo: { zh: '文件不可用', en: 'files down' },
       chGitOnly: { zh: '仅 git', en: 'git only' },
@@ -697,7 +698,12 @@ window.__ModuleLoader__.load({
           const gitOk = channel.gitOk === true || (channel.gitOk === undefined && channel.usable === true);
           const fileOk = channel.rawOk === true;
           const parts = [];
-          parts.push((gitOk ? t('chGitOk') : t('chGitNo')) + (channel.gitMs ? ' ' + channel.gitMs + 'ms' : ''));
+          /* An intermittent prefix answers some attempts and resets others, so the
+           * number of tries is part of the answer: "git ok after 2 tries" is a
+           * different thing from "git ok" on the first one. Only shown when it
+           * took more than one. */
+          const tries = channel.gitAttempts > 1 ? ' (' + channel.gitAttempts + t('chTries') + ')' : '';
+          parts.push((gitOk ? t('chGitOk') : t('chGitNo')) + (channel.gitMs ? ' ' + channel.gitMs + 'ms' : '') + tries);
           parts.push(fileOk
             ? t('chFileOk') + (channel.rawMs ? ' ' + channel.rawMs + 'ms' : '')
             : t('chFileNo') + (channel.gitOnly === true ? ' · ' + t('chGitOnly') : (channel.rawError ? ' · ' + channel.rawError : '')));

@@ -48,6 +48,14 @@ const NET_TIMEOUT_MS = 8_000
  * `ls-remote` in twelve seconds is not one worth installing, and waiting the full
  * transfer timeout for it makes the panel's channel list take half a minute. */
 const PROBE_GIT_TIMEOUT_MS = 12_000
+/* Some accelerators are reachable only intermittently: measured on a campus
+ * network, one prefix answered two of ten identical `ls-remote` calls and reset
+ * the rest. A single attempt therefore reports "unusable" for a channel that
+ * would have worked, so a probe retries. The retries are cheap in the common
+ * case — a reset arrives in a fraction of a second, not at the timeout — and
+ * the attempt count is reported so the panel can say what it took. */
+const PROBE_GIT_ATTEMPTS = 3
+const PROBE_GIT_RETRY_TIMEOUT_MS = 8_000
 
 /**
  * Accelerators, most reliable first.
@@ -195,7 +203,15 @@ function probeDirectTls(host = 'github.com', timeoutMs = 6000) {
   })
 }
 
-/** Run git; resolve to `{ok, stdout, stderr}` and never throw. */
+/**
+ * Run git; resolve to `{ok, stdout, stderr}` and never throw.
+ *
+ * Deliberately runs through whatever proxy configuration the machine already
+ * has, including this plugin's own takeover. A probe that bypassed the proxy
+ * would answer a question nobody asked: what the channel does on a direct
+ * connection. Measured here, bypassing made a working channel report as down —
+ * the plugin's forwarded tunnel was the only route that reached it.
+ */
 async function git(args, timeoutMs = GIT_TIMEOUT_MS) {
   try {
     const { stdout, stderr } = await execFileAsync('git', args, {
@@ -253,7 +269,17 @@ async function probeChannels() {
   const probes = await Promise.all(CHANNELS.map(async (channel) => {
     const started = Date.now()
     // Every channel is tested through git, because the rewrite is what the fix installs.
-    const gitResult = await git(['ls-remote', `${channel.gitPrefix}${PROBE_REPO}`], PROBE_GIT_TIMEOUT_MS)
+    // Retried: an intermittent prefix answers some attempts and resets others.
+    let gitResult = { ok: false, stdout: '', stderr: '' }
+    let gitAttempts = 0
+    for (let attempt = 1; attempt <= PROBE_GIT_ATTEMPTS; attempt += 1) {
+      gitAttempts = attempt
+      gitResult = await git(
+        ['ls-remote', `${channel.gitPrefix}${PROBE_REPO}`],
+        attempt === 1 ? PROBE_GIT_TIMEOUT_MS : PROBE_GIT_RETRY_TIMEOUT_MS,
+      )
+      if (gitResult.ok === true && /refs\//u.test(gitResult.stdout)) break
+    }
     const gitOk = gitResult.ok === true && /refs\//u.test(gitResult.stdout)
     const gitMs = Date.now() - started
     if (channel.urlPrefix === null) {
@@ -264,6 +290,7 @@ async function probeChannels() {
         gitOnly: true,
         rawOk: false,
         gitOk,
+        gitAttempts,
         gitMs,
         usable: gitOk,
         ms: gitMs,
@@ -281,6 +308,7 @@ async function probeChannels() {
       gitOnly: false,
       rawOk,
       gitOk,
+      gitAttempts,
       gitMs,
       usable: rawOk,
       rawMs: raw.ms,
@@ -389,8 +417,9 @@ async function applyFix(preferredId) {
     return { applied: false, reason: 'proxy-running', proxy: proxyInstance.snapshot() }
   }
   const channels = await probeChannels()
-  // Verification below goes through the rewrite, so a channel qualifies when git
-  // reaches it, not when its file endpoint answers.
+  // Either signal qualifies a channel to be *tried*: the probe's git result is the
+  // better predictor, but a prefix that serves files while its git endpoint is flaky
+  // still deserves the attempt, because the verification below is the real test.
   const usable = channels.filter((channel) => channel.gitOk === true || channel.usable === true)
   // Prefer a channel that also serves files: the rewrite and the URL converter are
   // better off on the same host, and a file-capable one is the more general service.
@@ -418,14 +447,26 @@ async function applyFix(preferredId) {
       continue
     }
     // Verify with the plain GitHub URL: this is what the user actually types.
-    const verify = await git(['ls-remote', `${GITHUB_PREFIX}${PROBE_REPO}`], GIT_TIMEOUT_MS)
+    // Retried for the same reason the probe is: an intermittent accelerator resets
+    // some connections and serves others, and one reset is not proof of failure.
+    let verify = { ok: false, stdout: '', stderr: '' }
+    let verifyAttempts = 0
+    for (let attempt = 1; attempt <= PROBE_GIT_ATTEMPTS; attempt += 1) {
+      verifyAttempts = attempt
+      verify = await git(
+        ['ls-remote', `${GITHUB_PREFIX}${PROBE_REPO}`],
+        attempt === 1 ? GIT_TIMEOUT_MS : PROBE_GIT_RETRY_TIMEOUT_MS,
+      )
+      if (verify.ok === true && /refs\//u.test(verify.stdout)) break
+    }
     const verified = verify.ok === true && /refs\//u.test(verify.stdout)
-    attempts.push({ id: channel.id, label: channel.label, installed: true, verified })
+    attempts.push({ id: channel.id, label: channel.label, installed: true, verified, verifyAttempts })
     if (verified) {
       return {
         applied: true,
         channel: { id: channel.id, label: channel.label, prefix: definition.gitPrefix, urlPrefix: definition.urlPrefix },
         attempts,
+        verifyAttempts,
         verifyHead: verify.stdout.split(/\r?\n/u)[0] || '',
       }
     }
