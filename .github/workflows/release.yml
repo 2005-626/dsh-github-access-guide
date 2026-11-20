@@ -7,11 +7,17 @@ name: release
 # pushed, but nothing can POST to the API to create the release itself. Running
 # it here borrows the workflow token instead.
 #
-# Deliberately driven by workflow_dispatch only. A push trigger would race the
-# tag: the commit that bumps package.json lands before the matching tag exists.
+# Deliberately not triggered by the tag push itself: the commit that bumps
+# package.json lands before the matching tag exists, so a tag trigger would race
+# it. A push to main runs it after both halves are in place, and the existence
+# check below makes a second run a no-op.
+#
+# workflow_dispatch stays available for a run triggered by hand.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: write
