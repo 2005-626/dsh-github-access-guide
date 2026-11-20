@@ -1,0 +1,76 @@
+name: release
+
+# Publishes the release for the version already recorded in package.json.
+#
+# This exists because the repository is maintained from a network where
+# api.github.com is unreachable: git over HTTPS gets through, so a tag can be
+# pushed, but nothing can POST to the API to create the release itself. Running
+# it here borrows the workflow token instead.
+#
+# Deliberately driven by workflow_dispatch only. A push trigger would race the
+# tag: the commit that bumps package.json lands before the matching tag exists.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read the version
+        id: meta
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require the tag to exist
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "::error::tag $TAG does not exist; push it before running this workflow"
+            exit 1
+          fi
+
+      - name: Skip when the release already exists
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "release $TAG already exists, nothing to do"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack the bundle
+        if: steps.probe.outputs.present == 'false'
+        run: |
+          mkdir -p dist
+          npm pack --pack-destination dist
+          # The listing points at releases/latest/download/<name>.tgz, so the asset
+          # name must not carry the version even though npm pack puts it there.
+          mv "dist/dsh-github-access-guide-${{ steps.meta.outputs.version }}.tgz" \
+             dist/dsh-github-access-guide.tgz
+          ls -l dist
+
+      - name: Create the release
+        if: steps.probe.outputs.present == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          gh release create "$TAG" dist/dsh-github-access-guide.tgz \
+            --title "v$VERSION" \
+            --notes "See [README.md](https://github.com/${{ github.repository }}#readme) for what this version changes."
