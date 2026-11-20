@@ -3,5 +3,6 @@ node_modules/
 .DS_Store
 _rel/
 _*.json
+_*.mjs
 _entry.yml
 dsh-github-access-guide.tgz
