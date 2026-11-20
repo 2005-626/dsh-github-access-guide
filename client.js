@@ -833,7 +833,7 @@ window.__ModuleLoader__.load({
       /* Either half of the WinINET takeover proves the machine points here: the PAC URL
        * is what browsers read, the manual entry is what non-PAC tools read. */
       const pacOn = system !== undefined && server !== undefined && typeof system.autoConfigURL === 'string'
-        && system.autoConfigURL === 'http://' + server + '/proxy.pac';
+        && system.autoConfigURL.indexOf('http://' + server + '/proxy.pac') === 0;
       const systemOn = pacOn
         || (system !== undefined && system.enabled === true && server !== undefined && system.server === server);
       const gitOn = tools !== undefined && tools.git !== undefined && server !== undefined && tools.git.indexOf(server) !== -1;

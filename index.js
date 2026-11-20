@@ -28,7 +28,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { connect as tlsConnect } from 'node:tls'
 import { request as httpsRequest } from 'node:https'
-import { createProxy, DEFAULT_PORT, normalizeRouting } from './proxy.js'
+import { createProxy, DEFAULT_PORT, normalizeRouting, routingSignature } from './proxy.js'
 import { engage, restore, readSnapshot, readSystemProxy, readToolProxy } from './system-proxy.js'
 
 const execFileAsync = promisify(execFile)
@@ -501,6 +501,13 @@ async function saveRouting(patch) {
   })
   routing = next
   proxyInstance.setRouting(next)
+  /* Windows caches a PAC script per URL, so a scope change has to move the URL or the
+   * browser keeps obeying yesterday's script. */
+  const running = proxyInstance.snapshot()
+  if (running.running === true && running.port !== undefined) {
+    const reapplied = await engage(running.port, { pacSignature: routingSignature(next) })
+    return { routing: next, pac: reapplied.pac, proxy: proxyInstance.snapshot() }
+  }
   try {
     const file = settingsPath()
     await fs.mkdir(path.dirname(file), { recursive: true })
@@ -530,7 +537,7 @@ async function checkProxyHealth() {
   if (proxyInstance.snapshot().running === true) return { action: 'ok' }
   const system = await readSystemProxy()
   const pacOwned = typeof system.autoConfigURL === 'string'
-    ? /^http:\/\/127\.0\.0\.1:\d+\/proxy\.pac$/u.test(system.autoConfigURL.trim())
+    ? /^http:\/\/127\.0\.0\.1:\d+\/proxy\.pac(?:\?\S*)?\/?$/u.test(system.autoConfigURL.trim())
     : false
   const manualOwned = system.enabled === true && typeof system.server === 'string'
     ? /^127\.0\.0\.1:\d+$/u.test(system.server.trim())
@@ -541,7 +548,7 @@ async function checkProxyHealth() {
   /* Without a snapshot `restore()` only knows about WinINET's enable flag, so a PAC URL
    * written by an install whose snapshot was lost has to be removed here. */
   const after = await readSystemProxy()
-  if (typeof after.autoConfigURL === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/proxy\.pac$/u.test(after.autoConfigURL.trim())) {
+  if (typeof after.autoConfigURL === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/proxy\.pac(?:\?\S*)?\/?$/u.test(after.autoConfigURL.trim())) {
     await execFileAsync('reg', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'AutoConfigURL', '/f'], { windowsHide: true, timeout: 10_000 }).catch(() => {})
   }
   return { action: 'restored', system: await readSystemProxy(), tools: restored.tools }
@@ -553,13 +560,17 @@ async function checkProxyHealth() {
  * This is the action for "make GitHub work reliably", and it is different in kind
  * from `applyFix`: the rewrite only helps git, while this covers the browser too,
  * because the racing happens below the HTTP layer.
+ *
+ * The PAC URL carries the routing fingerprint. Windows answers a PAC request from its
+ * own cache keyed on the URL, so without a changing query the scope saved in the panel
+ * would only take effect after a restart.
  */
 async function engageProxy() {
   const started = await proxyInstance.start()
   if (started.running !== true) {
     return { engaged: false, reason: 'proxy-start-failed', proxy: proxyInstance.snapshot() }
   }
-  const applied = await engage(started.port)
+  const applied = await engage(started.port, { pacSignature: routingSignature(routing) })
   /* The rewrite and the proxy are two answers to the same problem, and stacking them
    * sends git through an accelerator *and* through the proxy. With the proxy running
    * the plain URL works, so drop the rewrite this plugin installed. */
@@ -605,7 +616,7 @@ async function reconcileOnStart() {
   }
   const pacPort = (value) => {
     if (typeof value !== 'string') return undefined
-    const match = /^http:\/\/127\.0\.0\.1:(\d+)\/proxy\.pac$/u.exec(value.trim())
+    const match = /^http:\/\/127\.0\.0\.1:(\d+)\/proxy\.pac(?:\?\S*)?\/?$/u.exec(value.trim())
     return match === null ? undefined : Number(match[1])
   }
   /* The PAC URL is the current form of the takeover; the manual server value is what

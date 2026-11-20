@@ -71,6 +71,26 @@ const GITHUB_HOSTS = new Set(Object.keys(POOL))
 export const PAC_PATH = '/proxy.pac'
 
 /**
+ * Short stable fingerprint of a routing table.
+ *
+ * Windows caches a PAC *by URL*: fetching the same `/proxy.pac` again returns the
+ * script it already evaluated, so changing which sites are raced has no effect until
+ * the URL itself changes. Putting this value in the query string is what makes
+ * "save scope" actually do something.
+ */
+export function routingSignature(routingInput) {
+  const routing = normalizeRouting(routingInput)
+  const text = `${routing.full === true ? 'all' : 'some'}|${routing.extra.slice().sort().join(',')}`
+  /* FNV-1a, 32-bit: not a security hash, just a collision-unlikely URL token. */
+  let hash = 0x811c9dc5
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(36)
+}
+
+/**
  * Host suffixes the PAC routes here, in addition to the exact pool hosts.
  *
  * Sending only GitHub to this proxy matters because it is installed as the *system*

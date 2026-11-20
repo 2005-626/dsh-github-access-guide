@@ -41,7 +41,7 @@ If DSH exits while the proxy is engaged, the system would be left pointing at a 
 
 ## Which sites go through it
 
-The listener is installed as the **system** proxy, so every request the machine makes arrives at it. What happens next is decided by the PAC script it serves itself (`http://127.0.0.1:17897/proxy.pac`):
+The listener is installed as the **system** proxy, so every request the machine makes arrives at it. What happens next is decided by the PAC script it serves itself (`http://127.0.0.1:17897/proxy.pac?v=<scope>`):
 
 | Scope | What is raced |
 | --- | --- |
@@ -58,6 +58,8 @@ Two rules keep this safe for the sites it does *not* accelerate:
 Everything outside the scope is forwarded verbatim — one parallel dial on that host's own DNS answers, then a plain byte pipe — so installing the proxy cannot make an unrelated site worse.
 
 The scope lives in `$DSH_HOME/github-access-guide/settings.json`. It is deliberately *not* part of `proxy-state.json`: that file is the record of the machine before the takeover and is deleted on restore, while this is a preference that has to outlive one.
+
+Windows answers a PAC request from its own cache keyed on the **URL**, so rewriting the script in place would change nothing until a reboot. The PAC URL therefore carries a fingerprint of the current scope (`?v=d06s8n`). Saving a new scope re-registers the takeover under a new URL, which is what makes the change take effect on the next request instead of the next restart.
 
 ## The accelerator rewrite
 

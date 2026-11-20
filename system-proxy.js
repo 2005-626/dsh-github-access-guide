@@ -29,7 +29,7 @@ const ENVIRONMENT_KEY = 'HKCU\\Environment'
  * loopback. They are recognised so a leftover can be removed even when the snapshot is
  * gone, which is the only way to guarantee that no browser is left fetching a PAC from
  * a port that stopped listening. */
-const LOOPBACK_PAC = /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+\/proxy\.pac\/?$/iu
+const LOOPBACK_PAC = /^https?:\/\/(?:127\.0\.0\.1|localhost):\d+\/proxy\.pac(?:\?\S*)?\/?$/iu
 const LOOPBACK_APEX = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost):\d+(?:[;,]|$)/iu
 const PROXY_OVERRIDE = 'localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>'
 
@@ -41,8 +41,9 @@ const PROXY_OVERRIDE = 'localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*
  * site comes back as this plugin's 502. A PAC script is the only non-elevated way to
  * describe a whitelist, and it also means unrelated traffic never enters this process.
  */
-export function pacUrl(port) {
-  return `http://127.0.0.1:${port}${PAC_PATH}`
+export function pacUrl(port, signature) {
+  const token = typeof signature === 'string' && signature.length > 0 ? `?v=${encodeURIComponent(signature)}` : ''
+  return `http://127.0.0.1:${port}${PAC_PATH}${token}`
 }
 
 async function reg(...args) {
@@ -203,7 +204,7 @@ export async function readToolProxy() {
  * Idempotent: the snapshot is only taken when none exists yet, so calling this twice
  * never records the proxy we installed as if it were the user's own setting.
  */
-export async function engage(port) {
+export async function engage(port, options = {}) {
   const server = `127.0.0.1:${port}`
   const steps = {}
 
@@ -233,7 +234,7 @@ export async function engage(port) {
   /* The PAC is what browsers actually obey, so it is written last and only after the
    * manual settings are in place: if the script cannot be fetched they fall back to
    * these, which still work because the proxy forwards what it is not racing. */
-  const pac = pacUrl(port)
+  const pac = pacUrl(port, options.pacSignature)
   steps.pac = await writeString(INTERNET_SETTINGS, 'AutoConfigURL', pac)
   steps.notified = await notifyProxyChange()
 
